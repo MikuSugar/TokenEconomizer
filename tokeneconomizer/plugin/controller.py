@@ -65,8 +65,8 @@ class LiveController:
         """How a person runs one of the plugin's commands on this host."""
         if self.host.name in ("claude", "copilot"):    # Copilot's TUI runs plugin commands too
             return f"/tokeneconomizer:{name}"
-        if self.host.name == "pi":
-            return f"/te {name}"                 # registered by the Pi extension
+        if self.host.name in ("pi", "dsh"):
+            return f"/te {name}"                 # registered by the Pi extension / DSH bundle
         if self.host.name == "codex":
             return f"$tokeneconomizer:{name}"    # the plugin's Codex skills
         return f"te --host {self.host.name} {name}"
@@ -135,6 +135,15 @@ class LiveController:
         if (self.cfg.toolprune != "off" and denylist.supports(self.host.name)
                 and not self.cfg.shadow):
             outputs.extend(self._toolprune_notices(seen))
+
+        # A host whose deny list the plugin itself applies (DeepSeek Harness) needs the list
+        # in the answer: there is no settings file to read. It stays applied while
+        # `toolprune=off`, as an applied list does on the hosts that write one.
+        if denylist.supports(self.host.name) and not self.cfg.shadow:
+            restrictions = self.host.tool_restrictions(
+                denylist.applied_for(self.store, self.ctx.repo.root, self.host.name))
+            if restrictions:
+                outputs.append(restrictions)
 
         pause = sidecall.paused(self.host.name, self.ctx.root)
         calls_a_model = "distiller" in self.cfg.microskills or self.cfg.loopguard != "off"

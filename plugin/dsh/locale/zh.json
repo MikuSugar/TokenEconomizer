@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "TokenEconomizer",
+    "description": "从已结束的会话中学习仓库事实，在新会话中省去未使用的工具，并在回合陷入失败循环时提醒。"
+  }
+}

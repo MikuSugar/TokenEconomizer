@@ -1,0 +1,25 @@
+{
+  "name": "tokeneconomizer-dsh",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TokenEconomizer for the DeepSeek Harness: learned repository facts, tool pruning and a loop guard",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ]
+}

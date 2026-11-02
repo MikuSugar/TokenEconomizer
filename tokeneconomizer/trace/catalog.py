@@ -7,7 +7,9 @@ agent publishes it differently:
                    descriptions are a static property of the CLI build, joined from a snapshot
                    (`claude_tool_catalog.json`);
   * Copilot CLI -- its debug log, in one of three shapes depending on the build (below);
-  * Codex       -- a fixed default surface (it writes no tool dump).
+  * Codex       -- a fixed default surface (it writes no tool dump);
+  * DeepSeek Harness -- each request's `request/header` carries the exact tool schemas it was
+                   sent, which `dsh_session_to_claude` writes back as one `catalog` line.
 
 `catalog_sources` returns every source that produced anything, and `parse_catalog_with_source`
 the richest of them with its name, so a caller can record which source won and notice the next
@@ -133,6 +135,28 @@ def parse_tool_catalog_claude(transcript_text, max_desc=200, snapshot=None):
     return {n: (snap.get(n, "") or "")[:max_desc] for n in names}
 
 
+def parse_tool_catalog_dsh(transcript_text, max_desc=200):
+    """{tool_name: short_description} from the `catalog` line of a converted DSH trace.
+
+    DSH sends each request its visible tool schemas, and `dsh_session_to_claude` keeps the
+    last request's list as one line so the catalog survives the conversion. The last such
+    line wins: a session that ran under a tool restriction was sent the restricted set."""
+    found = {}
+    for line in (transcript_text or "").splitlines():
+        line = line.strip()
+        if '"type": "catalog"' not in line and '"type":"catalog"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        tools = ev.get("tools")
+        if isinstance(tools, list):
+            found = {str(t.get("name")): str(t.get("description") or "")[:max_desc]
+                     for t in tools if isinstance(t, dict) and t.get("name")}
+    return found
+
+
 def _read(path):
     try:
         return open(path, encoding="utf-8", errors="replace").read()
@@ -148,6 +172,9 @@ def catalog_sources(run_dir_path, agent):
         cat = parse_tool_catalog_claude(
             _read(os.path.join(run_dir_path, "transcript.jsonl")))
         return [("claude_transcript", cat)] if cat else []
+    if agent == "dsh":
+        cat = parse_tool_catalog_dsh(_read(os.path.join(run_dir_path, "transcript.jsonl")))
+        return [("dsh_request_header", cat)] if cat else []
     dbg = _read(os.path.join(run_dir_path, "copilot_debug.log"))
     tr = _read(os.path.join(run_dir_path, "transcript.jsonl"))
     out = []

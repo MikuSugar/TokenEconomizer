@@ -35,8 +35,9 @@ endpoint (docs/PLUGIN.md §3):
 
 `detect` picks the adapter from the payload: Codex's `turn_id`, or a transcript under `.codex/`
 named `rollout-*`; Copilot's session-state transcript, or no transcript at all inside a Copilot
-hook process; Claude Code otherwise. Each plugin hook file except Claude Code's also passes
-`--host` explicitly, so detection is the fallback rather than the rule.
+hook process; a DeepSeek Harness export under the plugin's `dsh-sessions/`; Claude Code
+otherwise. Each plugin hook file except Claude Code's also passes `--host` explicitly, so
+detection is the fallback rather than the rule.
 """
 import json
 import os
@@ -194,6 +195,12 @@ class Host:
 
     def tool_usage(self, trace_path):
         return trace.tool_usage(trace_path)
+
+    def tool_restrictions(self, items):
+        """The hook output that tells a host's own plugin which tools this session must not
+        offer, for the hosts whose deny list lives in the plugin rather than in a settings
+        file (DeepSeek Harness). {} everywhere else."""
+        return {}
 
 
 def _failure_response(p):
@@ -392,6 +399,74 @@ class OpenCode(Host):
 
     def session_usage(self, transcript_path):
         return trace.opencode_session_usage(transcript_path)
+
+
+class Dsh(Host):
+    """DeepSeek Harness (deepseek-ai/deepseek-harness), through the `plugin/dsh/` bundle.
+
+    DSH has no hook protocol of its own -- a plugin is a Cordis module on the Host's event bus
+    -- so the bundle speaks THIS one on DSH's behalf, as the Pi extension does: it calls the
+    same dispatcher with a Claude-shaped payload per event and applies the answer with DSH's
+    own levers (`agent/pre-step` messages, `tools/post-execute` additional contexts, a scoped
+    system-prompt section, `tools.restrict`). What it sends:
+
+      * `prompt_id`, which it numbers itself, for the turn identity DSH does not stamp;
+      * `transcript_path`, the session's events exported as JSONL into the plugin's state
+        directory (`dsh-sessions/<id>.jsonl`), which `trace.dsh_session_to_claude` reads;
+      * `tool_response = {content, isError, exit_code}`, the exit code read from DSH's own
+        `[exit code: N]` line or the result's metadata;
+      * `stop_reason` on Stop, so an aborted turn does not feed the envelope;
+      * DSH's mode in `TE_DSH_MODE` (`web`, or `headless` in a `dsh headless` run).
+
+    The deny list is applied by the bundle itself (`tools.restrict` on the agent's scope), so
+    the SessionStart answer carries it as `toolRestrictions` (`tool_restrictions`) instead of a
+    settings file; DSH records nothing in the repository.
+    """
+    name = "dsh"
+    prompt_context = True              # the bundle appends it to the prompt step's messages
+    # DSH's Web UI shows no plugin notices, so a still-stuck notice goes through the model.
+    relays_notices = True
+    # A resumed session gets the facts text its own start injected, not the current one.
+    keeps_start_context = False
+    interrupt = "Press Stop beside the composer to stop this turn."
+    end_run = "Stop the run to end it."
+
+    def turn_key(self, p):
+        return str(p.get("prompt_id") or "")
+
+    def cwd(self, p, env):
+        return p.get("cwd") or env.get("DSH_PROJECT_DIR") or os.getcwd()
+
+    def headless(self, env, transcript=None):
+        return str(env.get("TE_DSH_MODE", "")).strip() == "headless"
+
+    def stopped_normally(self, p):
+        return str((p or {}).get("stop_reason") or "completed") == "completed"
+
+    def mechanism_trace(self, transcript_path, workdir):
+        out = os.path.join(workdir, "dsh_trace.jsonl")
+        n = trace.dsh_session_to_claude(transcript_path, out)
+        return out if n is not None else None
+
+    def prompt_count(self, transcript_path):
+        return trace.dsh_prompt_count(transcript_path)
+
+    def session_usage(self, transcript_path):
+        return trace.dsh_session_usage(transcript_path)
+
+    def settle(self, transcript_path):
+        # The fold has already read this private export; it is not the harness's own log.
+        if not transcript_path:
+            return
+        if os.path.basename(os.path.dirname(os.path.realpath(transcript_path))) != "dsh-sessions":
+            return
+        try:
+            os.remove(transcript_path)
+        except OSError:
+            pass
+
+    def tool_restrictions(self, items):
+        return {"toolRestrictions": list(items)} if items else {}
 
 
 class Cursor(Host):
@@ -641,14 +716,14 @@ def _ancestor_args(limit=4):
 
 
 HOSTS = {"claude": ClaudeCode, "codex": Codex, "copilot": Copilot, "opencode": OpenCode,
-         "pi": Pi, "cursor": Cursor}
+         "pi": Pi, "cursor": Cursor, "dsh": Dsh}
 
 
 def default_host(env=None, recent=None):
     """The host a `te` command run without `--host` is about: `TE_HOST`, else the agent whose
-    shell it runs in (Claude Code marks its shell `CLAUDECODE=1`, Copilot `COPILOT_CLI=1`),
-    else -- a plain terminal -- `recent`, the agent that last worked in this repository (see
-    `cli`), else Claude Code."""
+    shell it runs in (Claude Code marks its shell `CLAUDECODE=1`, Copilot `COPILOT_CLI=1`, the
+    DeepSeek Harness sets `DSH_PROFILE`), else -- a plain terminal -- `recent`, the agent that
+    last worked in this repository (see `cli`), else Claude Code."""
     env = os.environ if env is None else env
     if env.get("TE_HOST") in HOSTS:
         return env["TE_HOST"]
@@ -658,6 +733,8 @@ def default_host(env=None, recent=None):
         return "copilot"
     if env.get("CURSOR_AGENT") or env.get("CURSOR_PROJECT_DIR"):
         return "cursor"
+    if env.get("DSH_PROFILE") or env.get("DSH_PROFILE_DIR"):
+        return "dsh"
     return recent if recent in HOSTS else "claude"
 
 
@@ -673,6 +750,8 @@ def detect(payload, env=None, hint=None):
         return Codex()
     if "/session-state/" in sp and tp.endswith("events.jsonl"):
         return Copilot()
+    if "/dsh-sessions/" in sp and tp.endswith(".jsonl"):
+        return Dsh()
     # Claude Code always sends a transcript path; Copilot sends none before Stop, and marks its
     # hook processes. (Hooks inherit the parent's environment, so the marker alone would also
     # tag a Claude Code session started from inside Copilot -- hence the transcript test first.)

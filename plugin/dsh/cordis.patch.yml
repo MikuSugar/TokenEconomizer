@@ -1,0 +1,4 @@
+- insert:
+    - id: tokeneconomizer
+      name: tokeneconomizer-dsh
+      config: {}

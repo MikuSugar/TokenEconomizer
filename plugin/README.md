@@ -1,12 +1,13 @@
 # TokenEconomizer plugin
 
-How to install and use TokenEconomizer in Claude Code, Codex, the GitHub Copilot CLI, Pi, Cursor
-(experimental), and opencode (experimental). What the plugin does and why is in the [main README](../README.md); its
-design and the verified behaviour of each agent are in [`docs/PLUGIN.md`](../docs/PLUGIN.md).
+How to install and use TokenEconomizer in Claude Code, Codex, the GitHub Copilot CLI, Pi, the
+DeepSeek Harness, Cursor (experimental), and opencode (experimental). What the plugin does and why
+is in the [main README](../README.md); its design and the verified behaviour of each agent are in
+[`docs/PLUGIN.md`](../docs/PLUGIN.md).
 
 - [Before you start](#before-you-start)
 - Install and use it on [Claude Code](#claude-code) · [Codex](#codex) ·
-  [Copilot CLI](#copilot-cli) · [Pi](#pi) · [Cursor](#cursor)
+  [Copilot CLI](#copilot-cli) · [Pi](#pi) · [DeepSeek Harness](#deepseek-harness) · [Cursor](#cursor)
 - [What to expect](#what-to-expect) · [Commands](#commands) · [Settings](#settings)
 - [Repository map](#repository-map) · [Using with rtk](#using-with-rtk) ·
   [Model calls and API keys](#model-calls-and-api-keys) · [Troubleshooting](#troubleshooting)
@@ -300,6 +301,54 @@ is a wrapper the calls should not run, set `pi_cli` to the real one.
 **Uninstall.** `pi remove git:github.com/microsoft/TokenEconomizer` (the source you installed
 from); `pi config` turns it off without removing it. Optional: `rm -rf ~/.tokeneconomizer`.
 
+## DeepSeek Harness
+
+**1. Install.** The Harness installs a bundle from a package directory:
+
+```bash
+git clone https://github.com/microsoft/TokenEconomizer.git
+```
+
+In the Harness, install `plugin/dsh` as a bundle from its absolute path (Plugin Manager, or the
+`plugin_manager` tool with `install_bundle`). Keep the clone in place: the bundle runs the
+plugin's launcher from it. Python 3.10 or newer must be on `PATH`, or `TE_PYTHON` must name one.
+
+**2. Check it.** Start a new session — the bundle attaches when an agent is created — and type
+`/te status`. It should print the status block, not an error.
+
+**3. Work normally.** See [What to expect](#what-to-expect). The facts it injects become a
+system-prompt section named `tokeneconomizer`; a loop guard redirect joins the tool result it
+followed. The deny list is applied by the bundle itself with the Harness's own tool restriction,
+so nothing is written into the repository, and it applies from the next session.
+`/te toolprune` shows it; `/te toolprune restore` gives a tool back. The tool catalog comes from
+each session's own requests, so there is no `refresh-catalog` to run, and `toolprune measure` is
+not available yet.
+
+**Messages.** The Web UI shows no plugin messages. The bundle writes the session start's
+one-line notices to the Harness's process log; the still-stuck notice is the exception — it is
+relayed through the model, so it appears in the turn's reply. `/te status` shows what it did.
+
+**When a session is learned from.** A session is folded when the Harness disposes it. A
+`dsh headless` run exits without disposing its session, and a session whose process was killed
+may too; such a session is folded by the next session start, once its export has been quiet for
+ten minutes.
+
+**Model calls.** The plugin's own calls (the loop guard's judge and writer, micro-skills'
+proposer) run inside the running Harness: the bundle serves a guarded local endpoint that makes
+one model call on the session's provider and model. `paid_model`, when set, picks the model but
+keeps the session's provider, so it must be a model that provider serves. A `te` command run from
+a plain terminal has no Harness to ask, so it makes no model calls; facts that need none are
+still learned.
+
+**Update.** `git pull` in the clone, then start a new session (the installed bundle links the
+clone).
+
+**Uninstall.**
+
+1. In each repository where tools were left out: `/te toolprune restore`.
+2. Remove the bundle from the Harness profile.
+3. Optional: `rm -rf ~/.tokeneconomizer`.
+
 ## Cursor
 
 **1. Install.** From the TokenEconomizer checkout, build a local Cursor plugin:
@@ -455,6 +504,7 @@ How to run them:
 | Codex | `$tokeneconomizer:<command>` (`status`, `microskills`, `toolprune`, `config`, `repos`) | `~/.tokeneconomizer/bin/te --host codex <command>` |
 | Copilot CLI | `/tokeneconomizer:<command>` (interactive mode) | `~/.tokeneconomizer/bin/te --host copilot <command>` |
 | Pi | `/te <command>` | `~/.tokeneconomizer/bin/te --host pi <command>` |
+| DeepSeek Harness | `/te <command>` (Web UI profiles) | `~/.tokeneconomizer/bin/te --host dsh <command>` |
 | opencode | none (run from a terminal) | `~/.tokeneconomizer/bin/te --host opencode <command>` |
 
 `doctor` and `repomap` run from a terminal (or as `/te …` on Pi); there is no slash command or
@@ -482,6 +532,7 @@ and are shared by every agent working in it. The examples use Claude Code's form
 | Codex | `$tokeneconomizer:config set loopguard=off` |
 | Copilot CLI | `/tokeneconomizer:config set loopguard=off` (interactive mode) |
 | Pi | `/te config set loopguard=off` |
+| DeepSeek Harness | `/te config set loopguard=off` |
 | any agent, from a terminal | `~/.tokeneconomizer/bin/te config set loopguard=off` |
 
 **Turn a mechanism on or off:**

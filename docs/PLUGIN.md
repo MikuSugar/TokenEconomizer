@@ -1,7 +1,8 @@
 # The plugin: design and verified agent behaviour
 
 How the plugin runs the three mechanisms inside your own Claude Code, Codex, Copilot CLI, Pi,
-opencode and Cursor sessions, through the hooks (on Pi, the extension events) each agent
+DeepSeek Harness, opencode and Cursor sessions, through the hooks (on Pi and the Harness, the
+extension/event-bus levers) each agent
 exposes: what it does at each hook, what differs from the experiments and why, the agent
 behaviour each choice rests on, where its state lives, and its known limitations. The code is `tokeneconomizer/plugin/` (what
 the hooks run) and `plugin/` (the packaging for each agent). To install and use it, see
@@ -498,6 +499,21 @@ reports no status (Claude Code); a run followed by other commands keeps the stat
 reported. Replayed through the guard, the recorded SWE-bench sessions end well in 85.6% of
 turns on Claude Code (13,312 sessions), 84.5% on Copilot (6,710) and 87.8% on Codex (2,653), and
 the judge's gate opens in 18.1%, 15.8% and 5.8% of them.
+
+**DeepSeek Harness, 2026-11-02** (0.2.1-rc.5; the bundle at `plugin/dsh/` installed in the
+desktop profile, and applied to a `dsh headless` run through a `--patch` overlay). Verified live
+in the headless session: the bundle activates without a Web UI or a command registry; its
+`agent/created` listener calls SessionStart, the answers' facts text becomes a system-prompt
+section named `tokeneconomizer`, and the recorded deny list is applied with `tools.restrict`;
+`turn/end` calls Stop with DSH's reason; the session's events are exported as JSONL, and
+`te --host dsh fold` folds that export into the repository's ledger (`host: dsh`, one prompt, the
+injected fact counted, the applied tool recorded). DSH records `usage` on every
+`assistant/message`, so a fold prices the session from its own log. A headless run exits without
+disposing its session, so its fold is left to the next session start, once the export has been
+quiet for ten minutes — the fallback the other hosts use for a killed session. Not verified live:
+the Web UI's `/te` command row and the side-call endpoint (the headless profile has no model
+credentials); both were exercised only through the stand-in Cordis context in
+`tests/test_dsh.py`.
 
 The plugin's proposer prompt lists each fact it holds with its claim, so a fact it has is not
 authored again under a new id; the experiments' prompt names the ids alone, as the paper ran it.

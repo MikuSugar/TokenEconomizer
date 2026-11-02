@@ -55,6 +55,17 @@ COPILOT_PROTECTED = frozenset({
     "read_agent", "list_agents", "write_agent", "ask_user", "web_fetch", "web_search",
     "report_intent", "update_todo", "sql",
 })
+# The DeepSeek Harness's own work surface and a person's tools there (the harness names tools in
+# lower snake case). The web is never proposed, as on every host; the sub-agent, goal and
+# schedule tools are a person's, and removing one after a quiet stretch would take it from the
+# task that next needs it.
+DSH_PROTECTED = frozenset({
+    "bash", "read", "write", "edit", "glob", "grep", "working_directory", "read_image",
+    "load_workspace_dependencies", "job_output", "job_list", "job_kill",
+    "web_fetch", "web_search", "ask_user_question", "skill", "todo_write", "present",
+    "subagent", "subagent_fork", "workflow", "list_agents", "send_message", "interrupt_agent",
+    "get_goal", "create_goal", "update_goal",
+})
 # Rarely used, but expensive to lose when a task needs them: proposed only after
 # HIGH_RISK_FACTOR times the usual evidence.
 HIGH_RISK = frozenset({"NotebookEdit"})
@@ -134,6 +145,11 @@ class LiveAdapter:
             observed |= set(trace.parse_tool_names_copilot(
                 open(transcript, encoding="utf-8", errors="replace").read()
                 if os.path.exists(transcript) else ""))
+        elif self.host.name == "dsh":
+            # The converted trace carries the session's last request header as a catalog line.
+            observed |= set(trace.parse_tool_catalog_dsh(
+                open(transcript, encoding="utf-8", errors="replace").read()
+                if os.path.exists(transcript) else ""))
         for name in observed:
             cat.setdefault(name, "")
         if not cat:
@@ -142,7 +158,8 @@ class LiveAdapter:
 
     # ---- tool pruning ----
     def protected_tools(self):
-        extra = COPILOT_PROTECTED if self.host.name == "copilot" else frozenset()
+        extra = (COPILOT_PROTECTED if self.host.name == "copilot"
+                 else DSH_PROTECTED if self.host.name == "dsh" else frozenset())
         return _Protected(PROTECTED_TOOLS | INTERACTIVE_PROTECTED | extra, self.protect)
 
     def inapplicable_tools(self):

@@ -31,8 +31,8 @@
 
 `te facts` and `te untool` are the earlier names of `microskills` and `toolprune`, and still work.
 `--cwd` picks the repository (default: the current directory) and `--host` the agent
-(claude | codex | copilot | pi; default: `TE_HOST`, else the agent whose shell runs `te`, else
-claude).
+(claude | codex | copilot | pi | dsh; default: `TE_HOST`, else the agent whose shell runs `te`,
+else claude).
 """
 import argparse
 import glob
@@ -196,12 +196,19 @@ def cmd_microskills(args):
 
 
 # ---- toolprune -----------------------------------------------------------------------------
+def _where(ctx, host):
+    """Where a deny list takes effect, as a command tells the person: a settings file for the
+    hosts that read one, the host plugin itself for DeepSeek Harness."""
+    if host in denylist.RECORD_ONLY:
+        return denylist.lever(host)
+    return denylist.settings_path(ctx.repo.root, host)
+
+
 def _toolprune_show(ctx, unt):
     host = ctx.host.name
     print(f"sessions observed: {unt.get('sessions', 0)} ({unt.get('prompts', 0)} prompts)  "
           f"catalog: {unt.get('catalog_source') or 'none yet'}")
-    print(f"applied ({denylist.unit(host, plural=True)} this plugin added to "
-          f"{denylist.settings_path(ctx.repo.root, host)}): "
+    print(f"applied ({denylist.unit(host, plural=True)}, from {_where(ctx, host)}): "
           f"{', '.join(denylist.applied_for(ctx.store, ctx.repo.root, host)) or '-'}")
     print(f"proposed: {', '.join(_proposal(ctx, unt)) or '-'}")
     pending = [t for t in (unt.get("auto_pending") or {}).get("items") or []
@@ -237,7 +244,7 @@ def _toolprune_show(ctx, unt):
                          f"({e.get('unused_prompts', 0)} prompts)")
                 print(f"  {name:24s} {e['tools']:3d} tools, {state}")
     streaks = unt.get("streaks") or {}
-    if streaks and host == "claude":
+    if streaks and host in ("claude", "dsh"):
         cfg = ctx.config
         prompts = unt.get("prompt_streaks") or {}
         print(f"how long each tool has gone unused (a tool never used is left out after "
@@ -246,7 +253,10 @@ def _toolprune_show(ctx, unt):
         for t, n in sorted(streaks.items(), key=lambda kv: (-kv[1], -prompts.get(kv[0], 0)))[:30]:
             used = "used" if t in set(unt.get("used_tools", [])) else ""
             print(f"  {n:4d} sessions {prompts.get(t, n):5d} prompts  {t} {used}")
-    if not unt.get("catalog_source") or unt.get("catalog_source") == "observed":
+    if host == "dsh":
+        print("note: the harness records each session's tool list itself, so there is no "
+              "`refresh-catalog` to run here.")
+    elif not unt.get("catalog_source") or unt.get("catalog_source") == "observed":
         if os.path.exists(os.path.join(ctx.root, "hosts", host, "catalog.json")):
             # Recorded, but a repository reads the catalog when its next session is folded.
             print("note: the catalog `toolprune refresh-catalog` recorded joins this repository's "
@@ -326,9 +336,12 @@ def cmd_toolprune(args):
             return 1
         # Named by the person: no longer one they gave back, whatever `restore` said before.
         denylist.set_kept(ctx.store, ctx.repo.root, host, remove=tools)
-        print(f"added: {', '.join(added) or '(already present)'}\n"
-              f"in {denylist.settings_path(ctx.repo.root, host)} -- takes effect from the next "
-              f"session.")
+        if host in denylist.RECORD_ONLY:
+            print(f"added: {', '.join(added) or '(already present)'}\n"
+                  f"{_where(ctx, host)}; the list applies from the next session.")
+        else:
+            print(f"added: {', '.join(added) or '(already present)'}\n"
+                  f"in {_where(ctx, host)} -- takes effect from the next session.")
         if host == "copilot" and added:
             if denylist.copilot_folder_trusted(ctx.repo.root) is False:
                 print("warning: Copilot reads a repository's .github/copilot settings only in a "
@@ -371,10 +384,18 @@ def cmd_toolprune(args):
             print("Codex needs no catalog: its removable capabilities are a fixed set "
                   f"({', '.join(denylist.CODEX_LIVE_CAPABILITIES)}), read from each session.")
             return 0
+        if host == "dsh":
+            print("the harness needs no catalog probe: each session records the exact tool "
+                  "schemas its requests were sent, and the fold reads them from there.")
+            return 0
         path, tools = toolcheck.refresh_catalog(state_root(), host=host)
         print(f"{len(tools)} tools recorded in {path}:\n  " + ", ".join(tools))
         return 0
     if action == "measure":
+        if host == "dsh":
+            print("measure is not available on the harness yet: its request header is in the "
+                  "session log, but the plugin's export is removed once the session is folded.")
+            return 1
         tools = args.tools or _proposal(ctx, unt) or denylist.applied_for(
             ctx.store, ctx.repo.root, host)
         if not tools:
@@ -631,10 +652,17 @@ def cmd_doctor(args):
         ok = False
     import shutil as _sh
     # Only the agents installed here: a Codex-only machine has no Claude Code catalog to probe.
-    agents = [h for h in ("claude", "codex", "copilot", "opencode", "pi")
-              if _sh.which(sidecall.claude_cli() if h == "claude" else h)]
+    agents = [h for h in ("claude", "codex", "copilot", "opencode", "pi", "cursor")
+              if _sh.which(sidecall.claude_cli() if h == "claude"
+                           else "cursor-agent" if h == "cursor" else h)]
+    # The DeepSeek Harness is a GUI application, not a command: its state (or the environment
+    # its own shell sets) is what says it works in this repository.
+    harness = bool(os.environ.get("DSH_PROFILE") or os.environ.get("DSH_PROFILE_DIR")
+                   or glob.glob(os.path.join(root, "repos", "*", "dsh")))
+    if harness:
+        agents.append("dsh")
     print(f"agents      "
-          f"{', '.join(agents) or 'none of claude, codex, copilot, opencode, pi on PATH'}")
+          f"{', '.join(agents) or 'none of claude, codex, copilot, opencode, pi, cursor on PATH'}")
     for h in agents:
         pause = sidecall.paused(h, root)
         if pause:
@@ -677,6 +705,11 @@ def cmd_doctor(args):
             pkgs = []
         mine = [p for p in pkgs if "tokeneconomizer" in json.dumps(p).lower()]
         print(f"pi          package {'installed: ' + str(mine[0]) if mine else 'not in ' + settings}")
+    if "dsh" in agents:
+        endpoint = ("endpoint present" if sidecall.dsh_available()
+                    else "no endpoint here, so a terminal command makes no model calls")
+        print(f"dsh         DeepSeek Harness: the plugin's side calls run inside the running "
+              f"app ({endpoint})")
     ctx = _ctx(args)
     print(f"repository  {ctx.repo.root}: {repos.describe(ctx.repo)}; state {ctx.repo.key}")
     home_git = os.path.join(paths.home_dir(), ".git")

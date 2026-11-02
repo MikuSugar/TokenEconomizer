@@ -20,6 +20,10 @@ session start, and the unit of removal is whatever that file can express:
     trusted folder (Copilot's `trustedFolders`). Copilot has no persistent per-tool filter
     (`--excluded-tools` is a launch flag; `permissions.deny` refuses calls but leaves the schema
     in the request), so a server is proposed only when every one of its tools has gone unused.
+  * DeepSeek Harness -- a TOOL, applied by the `plugin/dsh/` bundle itself: `tools.restrict`
+    on the agent's scope removes the tool from the request. The bundle has no settings file to
+    read, so the list lives in this plugin's state (`untool_applied.json`) and the SessionStart
+    answer carries it (`Host.tool_restrictions`). Nothing is written into the repository.
 
 Rules common to all three:
 
@@ -53,8 +57,12 @@ SETTINGS_REL = os.path.join(".claude", "settings.local.json")
 CODEX_CONFIG_REL = os.path.join(".codex", "config.toml")
 COPILOT_SETTINGS_REL = os.path.join(".github", "copilot", "settings.local.json")
 
-_SETTINGS = {"claude": SETTINGS_REL, "codex": CODEX_CONFIG_REL, "copilot": COPILOT_SETTINGS_REL}
-_UNITS = {"claude": "tool", "codex": "capability", "copilot": "MCP server"}
+_SETTINGS = {"claude": SETTINGS_REL, "codex": CODEX_CONFIG_REL, "copilot": COPILOT_SETTINGS_REL,
+             "dsh": ""}
+# Hosts whose lever the plugin applies itself: no settings file, only the record of what was
+# applied, which the host's plugin reads back from the SessionStart answer.
+RECORD_ONLY = frozenset({"dsh"})
+_UNITS = {"claude": "tool", "codex": "capability", "copilot": "MCP server", "dsh": "tool"}
 
 # Codex capability -> (table or None for top level, key, TOML value). Each probed project-local
 # on 0.153.1 (see the module docstring); `te_harness.codex` holds the launch-time superset.
@@ -83,6 +91,10 @@ def unit(host, plural=False):
 
 
 def settings_path(repo_root, host="claude"):
+    if host in RECORD_ONLY:
+        # No file: the checkout's canonical path is the record's key. Each checkout keeps the
+        # list it applied, as it keeps its own settings file on the hosts that write one.
+        return os.path.realpath(repo_root)
     return os.path.join(repo_root, _SETTINGS.get(host, SETTINGS_REL))
 
 
@@ -520,11 +532,40 @@ def codex_project_trusted(repo_root, env=None):
     return False
 
 
+# ---- the record-only host: DeepSeek Harness, whose plugin reads the list back -------------
+def _apply_record_only(repo_root, items, store, host):
+    path = settings_path(repo_root, host)
+    added = [t for t in items if t not in applied(store, path)]
+    if not added:
+        return []
+    _record(store, set(applied(store, path)) | set(added), path)
+    return added
+
+
+def _restore_record_only(repo_root, store, items, host):
+    path = settings_path(repo_root, host)
+    mine = set(applied(store, path))
+    target = mine if not items else mine & set(items)
+    if not target:
+        return []
+    _record(store, mine - target, path)
+    return sorted(target)
+
+
+def lever(host):
+    """Where this host's deny list takes effect, for a command's output."""
+    if host in RECORD_ONLY:
+        return "the harness plugin, from each new session"
+    return _SETTINGS.get(host, SETTINGS_REL).replace(os.sep, "/")
+
+
 # ---- dispatch ------------------------------------------------------------------------------
 def apply(repo_root, tools, store, host="claude"):
     """Write `tools` (tools, capabilities or MCP servers, by host). Returns those newly added."""
     if host == "codex":
         return _apply_codex(repo_root, tools, store)
+    if host in RECORD_ONLY:
+        return _apply_record_only(repo_root, tools, store, host)
     return _apply_json_list(repo_root, tools, store, host)
 
 
@@ -532,6 +573,8 @@ def restore(repo_root, store, tools=None, host="claude"):
     """Remove entries this plugin added (all of them, or just `tools`). Returns removed."""
     if host == "codex":
         return _restore_codex(repo_root, store, tools)
+    if host in RECORD_ONLY:
+        return _restore_record_only(repo_root, store, tools, host)
     return _restore_json_list(repo_root, store, tools, host)
 
 

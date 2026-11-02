@@ -63,8 +63,9 @@ mechanisms:
   turn is still stuck after that, TokenEconomizer tells you how to stop it; it never stops a turn
   itself.
 
-TokenEconomizer is a plugin for **Claude Code**, **Codex**, the **GitHub Copilot CLI** and **Pi**,
-with experimental support for **opencode** and **Cursor Agent**. Each italic letter above is a
+TokenEconomizer is a plugin for **Claude Code**, **Codex**, the **GitHub Copilot CLI**, **Pi**
+and the **DeepSeek Harness**, with experimental support for **opencode** and **Cursor Agent**.
+Each italic letter above is a
 setting, shown with its default ([Settings](#settings)), and each mechanism can be turned on or
 off. The plugin announces each action in one line, and if any part of it fails, your session
 carries on as if it were not installed. Its model calls (the fact proposer, and the judge with the
@@ -161,6 +162,16 @@ pi install git:github.com/microsoft/TokenEconomizer
 
 Start `pi` and run `/te status`.
 
+**DeepSeek Harness**
+
+```sh
+git clone https://github.com/microsoft/TokenEconomizer.git
+```
+
+Install `plugin/dsh` as a bundle in the Harness's Plugin Manager (install from a local
+directory, the absolute path of `plugin/dsh`), keep the clone where it is, and start a new
+session. The bundle runs the plugin's launcher from that clone. Type `/te status`.
+
 **Cursor Agent** (experimental)
 
 ```sh
@@ -197,6 +208,7 @@ To update:
 | Agent | Update |
 |---|---|
 | Claude Code, Copilot CLI, opencode | `git pull` in the clone |
+| DeepSeek Harness | `git pull` in the clone (the installed bundle links it) |
 | Codex | `git pull` in the clone, then the `codex plugin add` line again |
 | Pi | `pi update --extensions` |
 
@@ -211,6 +223,7 @@ uninstalling, using Copilot with your own model key, and troubleshooting.
 | Codex | 0.153.1 to 0.164.0 | not supported |
 | Copilot CLI | 1.0.83 to 1.0.102 | not supported |
 | Pi | 1.2.0 to 1.3.0 | 0.99.x: load the extension by path (below) |
+| DeepSeek Harness | 0.2.1-rc.5 (desktop 2026-10-29) | not tested |
 | Cursor Agent (experimental) | 3.24.9, macOS and Linux (below) | not tested |
 | opencode (experimental) | 1.19.5 and 2.2.0 | not tested |
 
@@ -236,6 +249,7 @@ commands. They have the same names on every agent; only the way you type them di
 | Claude Code, Copilot CLI | `/tokeneconomizer:<command>` |
 | Codex | `$tokeneconomizer:<command>` |
 | Pi | `/te <command>` |
+| DeepSeek Harness | `/te <command>` (Web UI profiles) |
 | opencode | from a terminal: `~/.tokeneconomizer/bin/te --host opencode <command>` |
 | Cursor Agent | from a terminal: `~/.tokeneconomizer/bin/te --host cursor <command>` |
 | a terminal, in the repository | `~/.tokeneconomizer/bin/te <command>` |
@@ -313,6 +327,7 @@ what it can leave out differs:
 | Codex | capability packages | `.codex/config.toml` |
 | Copilot CLI | whole MCP servers | `.github/copilot/settings.local.json` |
 | Pi | nothing (Pi loads only four tools) | — |
+| DeepSeek Harness | single tools, by the bundle's `tools.restrict` | nothing in the repository |
 | Cursor Agent | nothing yet | — |
 | opencode | nothing yet | — |
 
@@ -340,7 +355,7 @@ redirects, you see one line that ends with how to stop it:
 > calls). Press Esc to interrupt it.
 
 Where that line appears, and how to stop the turn, in the terminal UI and in a headless run
-(`claude -p`, `codex exec`, `copilot -p`, `pi -p`, `opencode run`):
+(`claude -p`, `codex exec`, `copilot -p`, `pi -p`, `opencode run`, `dsh headless`):
 
 | Agent | Interactive: where it shows | How to stop | Headless: where it shows | How to stop |
 |---|---|---|---|---|
@@ -348,6 +363,7 @@ Where that line appears, and how to stop the turn, in the terminal UI and in a h
 | Codex | in the conversation | Esc, then `/stop` | not shown | Ctrl+C |
 | Copilot CLI | in the conversation | Esc twice | on stdout | Ctrl+C |
 | Pi | as a notification | Esc | on stderr | Ctrl+C |
+| DeepSeek Harness | in its reply (the bundle relays it) | Stop beside the composer | in the final reply | stop the run |
 | opencode | as a notification | Esc | on stderr | Ctrl+C |
 
 - **Claude Code** shows a plugin's own lines only in its detailed transcript (Ctrl+O), so the
@@ -370,7 +386,7 @@ agent's own limits; afterwards, `te status` counts the redirects and "still stuc
 | [`tokeneconomizer/loopguard`](tokeneconomizer/loopguard/) | Failure-loop intervention: the per-call guard and its per-repository envelope |
 | [`tokeneconomizer/trace`](tokeneconomizer/trace/) | Each agent's session log, read into one shape |
 | [`tokeneconomizer/plugin`](tokeneconomizer/plugin/) | The runtime the hooks and the `te` command run |
-| [`plugin`](plugin/) | The installable plugin: manifests, hook files, launchers, slash commands, the Pi extension, the opencode plugin |
+| [`plugin`](plugin/) | The installable plugin: manifests, hook files, launchers, slash commands, the Pi extension, the opencode plugin, the DeepSeek Harness bundle |
 | [`experiments`](experiments/) | The harness, launchers and task sets behind the paper's results |
 | [`docs`](docs/) | `PLUGIN.md` (design, verified agent behavior) and `ARCHITECTURE.md` (how the package fits together) |
 | [`tests`](tests/) | Offline tests for the package and the plugin |

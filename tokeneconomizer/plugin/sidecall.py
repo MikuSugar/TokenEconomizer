@@ -32,6 +32,12 @@ so no extra API key is needed and the call is billed where the session is:
   * opencode: `opencode run --format json` in a throwaway directory, on the person's default
     model, with `bash`, `edit`, `webfetch` and `websearch` denied, no other plugin (`--pure` on
     1.x, `--standalone` on 2.x) and its session deleted afterwards.
+  * DeepSeek Harness: no CLI of its own, so the call goes back INTO the running harness: the
+    bundle serves `POST /tokeneconomizer/sidecall` on the Host's local web server, guarded by a
+    per-process token, and runs one `llm.stream` call on the provider and model the session
+    itself used. The hook learns the endpoint from `TE_DSH_SIDECALL`/`TE_DSH_TOKEN` in its
+    environment (set by the bundle), so a `te` command run from a plain terminal cannot make
+    these calls -- there is no harness to ask.
 
 Every side call runs with `TE_SIDECALL=1`, which the plugin's hook entry point treats as "do
 nothing": without it the nested agent would run this plugin's hooks and recurse. A call that
@@ -313,6 +319,72 @@ def opencode_call(prompt, model="", cli="opencode", timeout=TIMEOUT_S):
     return text, eff
 
 
+def dsh_available(env=None):
+    """Is a running DeepSeek Harness reachable for a side call? The bundle puts its endpoint in
+    the hook's environment; a `te` run from a plain terminal has none."""
+    env = os.environ if env is None else env
+    return bool((env.get("TE_DSH_SIDECALL") or "").strip())
+
+
+def _note_no_reply(host, detail):
+    """One line in errors.log for a call that came back empty; nothing else would show it."""
+    import time
+    from .paths import state_root
+    try:
+        root = state_root()
+        os.makedirs(root, exist_ok=True)
+        with open(os.path.join(root, "errors.log"), "a", encoding="utf-8") as fh:
+            fh.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} sidecall {host}: no reply "
+                     f"({detail})\n")
+    except OSError:
+        pass
+
+
+def dsh_call(prompt, model="", timeout=TIMEOUT_S, env=None):
+    """A side call through the running DeepSeek Harness (`plugin/dsh/` serves the endpoint).
+
+    The bundle runs the completion through the harness's own `llm` service on the provider and
+    model the session used, and answers `{text, usage}`; the model named by `paid_model` (or the
+    one passed in) replaces the session's. Returns `(text, effective_tokens)`; `("", None)` when
+    there is no harness endpoint in this process's environment."""
+    import urllib.error
+    import urllib.request
+    env = os.environ if env is None else env
+    url = (env.get("TE_DSH_SIDECALL") or "").strip()
+    provider = (env.get("TE_DSH_PROVIDER") or "").strip()
+    model = (model or env.get("TE_DSH_MODEL") or "").strip()
+    if not url or not provider or not model:
+        return "", None
+    body = json.dumps({"prompt": prompt, "provider": provider, "model": model}).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + (env.get("TE_DSH_TOKEN") or ""),
+    })
+    # A local endpoint must not go through a proxy the person's environment names.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
+    except (OSError, ValueError, urllib.error.URLError) as e:
+        _note_no_reply("dsh", str(e)[:300])
+        return "", None
+    if not isinstance(data, dict):
+        return "", None
+    text = data.get("text") or ""
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    eff = None
+    if usage:
+        eff, _ = accounting.effective({
+            "input_tokens": int(usage.get("inputTokens") or 0),
+            "cache_read_input_tokens": int(usage.get("cacheReadTokens") or 0),
+            "cache_creation_input_tokens": int(usage.get("cacheWriteTokens") or 0),
+            "output_tokens": int(usage.get("outputTokens") or 0),
+            "model": model})
+    if not text:
+        _note_no_reply("dsh", (data.get("error") or "empty reply")[:300])
+    return text, eff
+
+
 def cursor_call(prompt, model="", cli="cursor-agent", timeout=TIMEOUT_S):
     """Use Cursor Agent's read-only Ask mode for optimizer calls in an empty directory.
 
@@ -406,7 +478,8 @@ def copilot_call(prompt, model="", cli="copilot", timeout=TIMEOUT_S):
 
 
 # The command each agent's side calls run, as the notices name it; the rest run `<agent> -p`.
-_CALLS = {"codex": "codex exec", "opencode": "opencode run", "cursor": "cursor-agent -p"}
+_CALLS = {"codex": "codex exec", "opencode": "opencode run", "cursor": "cursor-agent -p",
+          "dsh": "the harness's model"}
 
 
 def call_name(host_name):
@@ -417,7 +490,9 @@ def call_name(host_name):
 def runner_for(host_name, config):
     """The optimizer callable for this host. Each host's calls go through that host's own CLI,
     never another agent's. The caller decides whether a call is allowed: micro-skills' proposer
-    when micro-skills is on, the loop guard's judge when the guard is."""
+    when micro-skills is on, the loop guard's judge when the guard is. A host with no way to
+    make the call (the DeepSeek Harness, from a terminal) gets None: the mechanisms then learn
+    only what needs no model call."""
     model = config.paid_model
     if host_name == "pi":
         cli = os.path.expanduser(config.pi_cli) if config.pi_cli else "pi"
@@ -428,6 +503,10 @@ def runner_for(host_name, config):
         return lambda prompt, _m="agent": opencode_call(prompt, model=model)
     if host_name == "cursor":
         return lambda prompt, _m="agent": cursor_call(prompt, model=model)
+    if host_name == "dsh":
+        if not dsh_available():
+            return None
+        return lambda prompt, _m="agent": dsh_call(prompt, model=model)
     if host_name == "codex":
         return lambda prompt, _m="agent": codex_call(prompt, model=model)
     if host_name == "copilot":

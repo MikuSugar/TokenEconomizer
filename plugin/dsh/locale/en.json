@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "TokenEconomizer",
+    "description": "Learns repository facts from finished sessions, leaves unused tools out of new ones, and guards turns that get stuck in a failing loop."
+  }
+}
