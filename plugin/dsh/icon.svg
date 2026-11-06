@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="TokenEconomizer">
+  <rect width="64" height="64" rx="14" fill="#1f6f5f"/>
+  <path d="M20 18h24" stroke="#f5f7f6" stroke-width="4" stroke-linecap="round"/>
+  <path d="M32 18v20" stroke="#f5f7f6" stroke-width="4" stroke-linecap="round"/>
+  <path d="M24 32l8 8 8-8" fill="none" stroke="#9fe3cf" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M20 46h24" stroke="#9fe3cf" stroke-width="3" stroke-linecap="round" stroke-dasharray="1 6"/>
+  <circle cx="46" cy="18" r="3" fill="#f5f7f6"/>
+</svg>

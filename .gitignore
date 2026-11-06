@@ -34,6 +34,8 @@ experiments/figures/
 # ...except the figures the README and docs show.
 !docs/assets/*.png
 !docs/assets/*.svg
+# ...and the DSH bundle's icon, which its package.json exports.
+!plugin/dsh/icon.svg
 
 # Aggregated tables derived from results/.
 *.csv
