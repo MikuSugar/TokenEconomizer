@@ -13,7 +13,9 @@ an adapter rather than a branch in a mechanism:
     false}` from PostToolUse would halt its loop (verified on 2.1.286), but Codex's replaces the
     tool result and the model carries on, and Copilot's runs every call; the person decides.
   * Tool results. Claude Code's Bash `tool_response` is `{stdout, stderr, interrupted, ...}` with
-    no exit code (verified); Codex's command items carry one, and it is used when present.
+    no exit code (verified), and a non-zero exit comes as `PostToolUseFailure` instead, so a
+    success is read as 0 where that status covers the command (`claude_success_code`); Codex's
+    command items carry one, and it is used when present.
   * The session log. Claude Code's transcript is read as-is; Codex's rollout is rewritten into
     exec-stream lines first (`trace.codex_rollout_to_exec`).
 
@@ -59,6 +61,10 @@ RESULT_CAP = 20000      # characters of a tool result the guard folds (errors li
 PROGRESS = "_progress"
 
 
+class FoldLater(Exception):
+    """A finished session's log cannot be had now but may be later: it stays unfolded."""
+
+
 def response_text(resp, cap=RESULT_CAP):
     """Best-effort text of a hook's `tool_response`, whatever shape the tool returned."""
     if resp is None:
@@ -66,8 +72,8 @@ def response_text(resp, cap=RESULT_CAP):
     if isinstance(resp, str):
         return resp[:cap]
     if isinstance(resp, list):
-        return " ".join(x.get("text", "") if isinstance(x, dict) else str(x)
-                        for x in resp)[:cap]
+        return "\n".join(x.get("text", "") if isinstance(x, dict) else str(x)
+                         for x in resp)[:cap]
     if isinstance(resp, dict):
         parts = []
         for k in _RESPONSE_KEYS:
@@ -75,7 +81,7 @@ def response_text(resp, cap=RESULT_CAP):
             if isinstance(v, str) and v:
                 parts.append(v)
             elif isinstance(v, list):
-                parts.append(" ".join(x.get("text", "") for x in v if isinstance(x, dict)))
+                parts.append("\n".join(x.get("text", "") for x in v if isinstance(x, dict)))
         if parts:
             return "\n".join(parts)[:cap]
         return json.dumps(resp, sort_keys=True)[:cap]
@@ -193,6 +199,20 @@ class Host:
     def settle(self, transcript_path):
         """Wait, if this host needs to, until the finished session's log is complete."""
 
+    def complete(self, transcript_path, session_id, cwd=None, session=None):
+        """The log to fold the finished session from: `transcript_path`, unless this host can
+        fetch a whole one where the copy it was sent holds nothing (`cwd`: where the session
+        ran; `session`: its state). Raises `FoldLater` if a later fold may yet get it."""
+        return transcript_path
+
+    def last_active(self, transcript_path, session):
+        """When a session that never said it ended last did anything (`session`: its state)."""
+        return os.path.getmtime(transcript_path)
+
+    def session_state(self, env):
+        """What a session's state keeps from the environment of its first hook."""
+        return {}
+
     def tool_usage(self, trace_path):
         return trace.tool_usage(trace_path)
 
@@ -201,6 +221,16 @@ class Host:
         offer, for the hosts whose deny list lives in the plugin rather than in a settings
         file (DeepSeek Harness). {} everywhere else."""
         return {}
+
+    # Whether the agent keeps its sessions' logs where the plugin can read the ones from before
+    # it was installed (`history`).
+    keeps_history = False
+
+    def history(self, env, extra_dirs=()):
+        """The agent's own session logs, for importing a repository's earlier sessions:
+        [{"session_id", "folder", "path", "mtime", "size"}]. Nothing, where the agent keeps none
+        the plugin reads."""
+        return []
 
 
 def _failure_response(p):
@@ -237,6 +267,21 @@ def _exit_code(resp):
     return None
 
 
+def claude_success_code(name, args, resp=None):
+    """The exit status of a Claude Code shell call that came back as a success. Claude Code
+    reports a non-zero exit only as a failure (`PostToolUseFailure`, and `is_error` in its log)
+    and gives a success no status, so the loop guard read the output's markers instead: a
+    passing Playwright run whose exit prints libuv's "Assertion failed", or source read with
+    `cat` that mentions an `Error`, counted as failing (#128). 0 when that status covers the work
+    the command ran (`loopguard.exit_status_covers`); else None, and the markers decide."""
+    from ..loopguard.state import canon_tool
+    from ..loopguard.turn import exit_status_covers
+    if canon_tool(name) != "bash" or (isinstance(resp, dict) and resp.get("interrupted")):
+        return None
+    cmd = args.get("command") if isinstance(args, dict) else None
+    return 0 if exit_status_covers(cmd) else None
+
+
 class ClaudeCode(Host):
     name = "claude"
     interrupt = "Press Esc to interrupt it."       # 2.1.306: the running command is killed too
@@ -247,6 +292,12 @@ class ClaudeCode(Host):
 
     def turn_key(self, p):
         return str(p.get("prompt_id") or "")
+
+    def tool_call(self, p):
+        name, args, text, code = super().tool_call(p)
+        if code is None and _failure_response(p) is None:
+            code = claude_success_code(name, args, p.get("tool_response"))
+        return name, args, text, code
 
     def env_session_id(self, env):
         # Claude Code exports its session id to the Bash tool's shell (seen on 2.1.304).
@@ -269,6 +320,32 @@ class ClaudeCode(Host):
 
     def tool_usage(self, trace_path):
         return trace.claude_tool_usage(os.path.realpath(trace_path))
+
+    keeps_history = True
+
+    def history(self, env, extra_dirs=()):
+        """Every top-level log under `$CLAUDE_CONFIG_DIR/projects` (else `~/.claude/projects`)
+        and the `extra_dirs` (each a `projects` folder, or a config folder holding one); a
+        session filed in two of them is listed once, from the first."""
+        dirs = [trace.claude_projects_dir(env)]
+        for d in extra_dirs or ():
+            d = os.path.expanduser(str(d))
+            dirs.append(os.path.join(d, "projects") if os.path.isdir(os.path.join(d, "projects"))
+                        else d)
+        out, seen, seen_dirs = [], set(), set()
+        for d in dirs:
+            real = os.path.realpath(d)
+            if real in seen_dirs:
+                continue
+            seen_dirs.add(real)
+            for folder, path, mtime, size in trace.claude_history_logs(d):
+                sid = os.path.basename(path)[:-len(".jsonl")]
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                out.append({"session_id": sid, "folder": folder, "path": path, "mtime": mtime,
+                            "size": size})
+        return out
 
 
 _CODEX_SHELL = {"bash", "shell", "exec_command", "local_shell", "unified_exec",
@@ -372,8 +449,9 @@ class OpenCode(Host):
 
       * `prompt_id`, which it numbers itself, for the turn identity opencode does not stamp;
       * `transcript_path`, the session's export as JSON, written at the end of every turn (from
-        `opencode export` on 1.x; recorded by the plugin from its events on 2.x, which has no
-        export), since opencode's own database is not a format to read;
+        `opencode export` on 1.x; recorded by the plugin from its events on 2.x), since
+        opencode's own database is not a format to read. Where that copy holds no prompt, the
+        fold asks opencode for its export instead (`complete`);
       * `tool_response = {content, isError, exit_code}`, with `exit_code` from the bash tool's
         `metadata.exit` when it reports one;
       * opencode's mode in `TE_OPENCODE_MODE`: `run` (headless, `opencode run`) or `tui`.
@@ -399,6 +477,58 @@ class OpenCode(Host):
 
     def session_usage(self, transcript_path):
         return trace.opencode_session_usage(transcript_path)
+
+    # opencode has the session a second or so after it ends (2.2.5), so it is asked again.
+    EXPORT_TRIES = 3
+    EXPORT_WAIT_S = 2.0
+
+    def complete(self, transcript_path, session_id, cwd=None, session=None):
+        """The plugin's copy of the session, or, where it holds no prompt, opencode's own export
+        written in its place. On 2.2.5 the copy the 2.x plugin records from events came out
+        empty (#118); the fold runs after the session, when `opencode session export` (`opencode
+        export` on 1.x) has all of it. opencode finds a session within the project it is run
+        in, so the export runs where the session did (`cwd`). The copy stays as it was if
+        opencode has nothing."""
+        import subprocess
+        from .paths import state_root
+        from .sidecall import program
+        if (trace.opencode_prompt_count(transcript_path or "")
+                or not re.fullmatch(r"[\w-]+", session_id or "")):
+            return transcript_path
+        path = transcript_path or os.path.join(state_root(), "opencode-sessions",
+                                               f"{session_id}.json")
+        env = dict(os.environ, TE_SIDECALL="1")
+        cwd = cwd if cwd and os.path.isdir(cwd) else None
+        tmp = f"{path}.{os.getpid()}.tmp"
+        for attempt in range(self.EXPORT_TRIES):
+            if attempt:
+                time.sleep(self.EXPORT_WAIT_S)
+            for args in (["session", "export"], ["export"]):
+                try:
+                    out = subprocess.run([*program("opencode"), *args, session_id],
+                                         capture_output=True, encoding="utf-8", errors="replace",
+                                         timeout=60, env=env, cwd=cwd, stdin=subprocess.DEVNULL)
+                except (OSError, subprocess.SubprocessError):
+                    return transcript_path
+                if out.returncode == 0 and (out.stdout or "").lstrip().startswith("{"):
+                    break
+            else:
+                continue
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(out.stdout)
+                if trace.opencode_prompt_count(tmp):
+                    os.replace(tmp, path)
+                    return path
+            except OSError:
+                return transcript_path
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        return transcript_path
 
 
 class Dsh(Host):
@@ -624,6 +754,83 @@ class Cursor(Host):
         return (p or {}).get("status") == "completed"
 
 
+class Hermes(Host):
+    """Hermes Agent (NousResearch/hermes-agent), through the plugin in `plugin/hermes/`.
+
+    Hermes has no hook protocol of this shape -- its plugins are Python functions in the gateway
+    process that runs every session -- so the plugin speaks THIS one on Hermes's behalf, as the
+    opencode plugin does. What it sends:
+
+      * `prompt_id`, Hermes's own `turn_id`;
+      * `cwd`, the directory the session's row records, never the gateway's;
+      * `transcript_path`, where the fold writes the session's rows as JSON (`trace/hermes.py`);
+      * `tool_response = {content, status, error}`: the tool's result string as Hermes holds it,
+        which is read here for the tool's exit code;
+      * the session's origin in `TE_HERMES_MODE`: `oneshot` (`hermes -z`, `chat --oneshot`) or `cli`.
+    """
+    name = "hermes"
+    prompt_context = True              # the plugin returns it from `pre_llm_call`
+    # A hook has no verified way to reach the person's view, so the model passes the notice on.
+    relays_notices = True
+    # Hermes's docs (0.22.5): Ctrl+C on an empty prompt interrupts the agent, twice exits.
+    interrupt = "Press Ctrl+C to interrupt it."
+    end_run = "Press Ctrl+C to end the run."
+    # A session a fold cannot read is retried at each start in its repository for this long, then
+    # folded as unreadable, so one whose row was deleted is not retried for ever.
+    FOLD_RETRY_S = 7 * 86400
+
+    def turn_key(self, p):
+        return str(p.get("prompt_id") or "")
+
+    def headless(self, env, transcript=None):
+        return str(env.get("TE_HERMES_MODE", "")).strip() == "oneshot"
+
+    def tool_call(self, p):
+        name, args = trace.hermes_tool(str(p.get("tool_name") or ""), p.get("tool_input"))
+        resp = p.get("tool_response")
+        resp = resp if isinstance(resp, dict) else {"content": resp}
+        text, code, _ = trace.hermes_result(resp.get("content"))
+        return name, args, response_text(text), code
+
+    def complete(self, transcript_path, session_id, cwd=None, session=None):
+        """The session as `state.db` holds it now, so one that ended in mid-turn, with no turn's
+        end to copy it at, is folded too. The copy stays as it was if the row cannot be read;
+        with no copy either the fold waits, up to `FOLD_RETRY_S`: the database may be busy, or
+        this process, a `te fold` in a shell, in another Hermes profile than the session's."""
+        from .paths import state_root
+        from .sidecall import hermes_home
+        if not re.fullmatch(r"[\w-]+", session_id or ""):
+            return transcript_path
+        session = session or {}
+        path = transcript_path or os.path.join(state_root(), "hermes-sessions",
+                                               f"{session_id}.json")
+        db = os.path.join(session.get("hermes_home") or hermes_home(), "state.db")
+        if trace.hermes_export(db, session_id, path) or os.path.exists(path):
+            return path
+        if time.time() - self.last_active(path, session) < self.FOLD_RETRY_S:
+            raise FoldLater(session_id)
+        return transcript_path
+
+    def last_active(self, transcript_path, session):
+        """A running session has no log of its own to date, but every hook saves its state."""
+        return float(session.get("updated") or session.get("started") or 0)
+
+    def session_state(self, env):
+        from .sidecall import hermes_home
+        return {"hermes_home": hermes_home(env)}
+
+    def mechanism_trace(self, transcript_path, workdir):
+        out = os.path.join(workdir, "hermes_trace.jsonl")
+        n = trace.hermes_session_to_claude(transcript_path, out)
+        return out if n is not None else None
+
+    def prompt_count(self, transcript_path):
+        return trace.hermes_prompt_count(transcript_path)
+
+    def session_usage(self, transcript_path):
+        return trace.hermes_session_usage(transcript_path)
+
+
 def copilot_home(env=None):
     env = os.environ if env is None else env
     return env.get("COPILOT_HOME") or os.path.join(os.path.expanduser("~"), ".copilot")
@@ -716,7 +923,7 @@ def _ancestor_args(limit=4):
 
 
 HOSTS = {"claude": ClaudeCode, "codex": Codex, "copilot": Copilot, "opencode": OpenCode,
-         "pi": Pi, "cursor": Cursor, "dsh": Dsh}
+         "pi": Pi, "cursor": Cursor, "dsh": Dsh, "hermes": Hermes}
 
 
 def default_host(env=None, recent=None):

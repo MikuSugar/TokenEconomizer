@@ -25,6 +25,17 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_history(tmp_path_factory, monkeypatch):
+    """No test reads the person's own agent logs: a first session start imports what Claude
+    Code keeps under `~/.claude/projects` (`CLAUDE_CONFIG_DIR`). Both point at an empty
+    directory; a test that wants earlier sessions writes them there or names its own."""
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+
+
+@pytest.fixture(autouse=True)
 def _no_model_calls(request, monkeypatch):
     """No test reaches a real agent CLI. With the loop guard on, a stuck-looking turn wakes its
     judge: the plugin's side calls answer nothing here, and a judge job runs inline instead of
@@ -33,5 +44,5 @@ def _no_model_calls(request, monkeypatch):
     monkeypatch.setattr(judge, "spawn_job", judge.run_job)
     if request.node.get_closest_marker("real_sidecalls"):
         return
-    for name in ("claude_call", "codex_call", "copilot_call", "pi_call"):
+    for name in ("claude_call", "codex_call", "copilot_call", "hermes_call", "pi_call"):
         monkeypatch.setattr(sidecall, name, lambda *a, **k: ("", None))

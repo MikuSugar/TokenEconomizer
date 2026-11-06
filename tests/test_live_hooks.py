@@ -23,6 +23,8 @@ from tokeneconomizer.plugin.controller import LiveController
 from tokeneconomizer.plugin.paths import repo_identity, repo_state_dir
 from tokeneconomizer.plugin.store import Store
 
+from fixtures import opencode_session_export
+
 
 @pytest.fixture
 def env(tmp_path):
@@ -245,13 +247,27 @@ def test_a_resumed_copilot_session_gets_back_the_facts_it_started_with(env, repo
 
 
 # ---- the spiral guard --------------------------------------------------------------------
+def claude_failed(output, code=1):
+    """A failed Claude Code call as it arrives: a PostToolUseFailure `error` naming the exit
+    code, and no `tool_response`. Claude Code reports a success with no exit code, which the
+    plugin reads as 0 (#128), so a failing run is never a PostToolUse."""
+    return {"error": f"Exit code {code}\n{output}"}
+
+
+def _post(base, name, args, result, rkey="tool_response"):
+    if isinstance(result, dict) and set(result) == {"error"}:
+        return dict(base, hook_event_name="PostToolUseFailure", tool_name=name, tool_input=args,
+                    error=result["error"])
+    return dict(base, hook_event_name="PostToolUse", tool_name=name, tool_input=args,
+                **{rkey: result})
+
+
 def _turn(env, repo, sid, key, calls, host=None):
     """One prompt-turn through UserPromptSubmit -> PostToolUse* -> Stop; outputs per call."""
     idk = "turn_id" if host == "codex" else "prompt_id"
     base = {"session_id": sid, "transcript_path": "", "cwd": repo, idk: key}
     call(env, dict(base, hook_event_name="UserPromptSubmit", prompt="go"), host)
-    outs = [call(env, dict(base, hook_event_name="PostToolUse", tool_name=n, tool_input=i,
-                           tool_response=r), host) for n, i, r in calls]
+    outs = [call(env, _post(base, n, i, r), host) for n, i, r in calls]
     call(env, dict(base, hook_event_name="Stop", stop_hook_active=False), host)
     return outs
 
@@ -271,7 +287,7 @@ def stuck_calls(n, host=None):
             fail = "FAILED tests/test_a.py::test_x - AssertionError: assert 1 == 2"
             out.append(("exec_command", {"command": "pytest -q"}, {"output": fail, "exit_code": 1})
                        if host == "codex" else
-                       ("Bash", {"command": "pytest -q"}, {"stdout": fail, "stderr": ""}))
+                       ("Bash", {"command": "pytest -q"}, claude_failed(fail)))
     return out
 
 
@@ -307,8 +323,7 @@ def _guard_turn(env, repo, sid, key, calls, host):
         base[idk] = key
     rkey = "tool_result" if host == "copilot" else "tool_response"
     call(env, dict(base, hook_event_name="UserPromptSubmit", prompt="go"), host)
-    outs = [call(env, dict(base, hook_event_name="PostToolUse", tool_name=n, tool_input=i,
-                           **{rkey: r}), host) for n, i, r in calls]
+    outs = [call(env, _post(base, n, i, r, rkey), host) for n, i, r in calls]
     call(env, dict(base, hook_event_name="Stop", stop_hook_active=False), host)
     return outs
 
@@ -472,7 +487,7 @@ def _warm(env, repo):
 
 
 def test_only_turns_that_end_green_feed_the_envelope(env, repo):
-    fail = {"stdout": "FAILED tests/test_a.py::t - AssertionError", "stderr": ""}
+    fail = claude_failed("FAILED tests/test_a.py::t - AssertionError")
     _turn(env, repo, "s", "red", [("Edit", {"file_path": "/r/a.py"}, "ok"),
                                   ("Bash", {"command": "pytest -q"}, fail)])
     _turn(env, repo, "s", "green", [("Edit", {"file_path": "/r/a.py"}, "ok"),
@@ -1187,6 +1202,29 @@ def test_copilot_apply_and_restore_touch_only_the_plugins_own_servers(repo, tmp_
         os.path.join(repo, ".git", "info", "exclude")).read().split()
 
 
+# ---- opencode ----------------------------------------------------------------------------
+def test_an_opencode_session_whose_copy_is_empty_is_folded_from_opencodes_export(
+        env, repo, tmp_path, monkeypatch):
+    """#118: on opencode 2.2.5 the plugin's copy of every session came out empty, so nothing was
+    learned. The fold reads opencode's own export instead (`opencode session export`)."""
+    import subprocess
+    copy = tmp_path / "ses_f.json"
+    copy.write_text(json.dumps({"info": {"id": "ses_f"}, "messages": []}))
+    asked = []
+
+    def fake_run(cmd, **kw):
+        asked.append((cmd[1:], kw["cwd"]))
+        return subprocess.CompletedProcess(cmd, 0, stdout=opencode_session_export(), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    run_session(env, repo, "ses_f", str(copy), host="opencode")
+    # opencode finds a session within the project it is run in: where the session ran
+    assert asked == [(["session", "export", "ses_f"], repo)]
+    (rec,) = [r for r in store_for(env, repo, "opencode").read_lines("ledger.jsonl")
+              if r.get("kind") == "session"]
+    assert rec["prompts"] == 1 and "error" not in rec and rec["effective_tokens"]
+
+
 # ---- Codex capability untooling ----------------------------------------------------------
 def codex_rollout(path, repo, i, exec_inputs=(), prompts=1):
     """A Codex rollout of `prompts` turns: in the first, one shell command and, per
@@ -1404,6 +1442,31 @@ def test_copilot_trust_is_read_from_its_config(tmp_path, repo):
     (home / "config.json").write_text(json.dumps({"trustedFolders": [repo + "-other"]}))
     assert denylist.copilot_folder_trusted(repo, env) is False
 
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows paths are case-insensitive")
+def test_copilot_trust_matches_paths_with_different_case_on_windows(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "copilot-home"
+    home.mkdir()
+    env = {"COPILOT_HOME": str(home)}
+
+    repo = tmp_path / "MixedCaseRepo"
+    repo.mkdir()
+
+    configured_path = str(repo).lower()
+    assert configured_path != str(repo)
+
+    (home / "config.json").write_text(
+        json.dumps({"trustedFolders": [configured_path]})
+    )
+
+    # Preserve the input casing so the test exercises normcase().
+    monkeypatch.setattr(
+        denylist.os.path, "realpath", lambda path: os.fspath(path)
+    )
+
+    assert denylist.copilot_folder_trusted(repo, env) is True
 
 # ---- a failed call reaches the guard on Claude Code -------------------------------------------
 # Claude Code 2.1.299 reports a failed call -- a non-zero exit, a refused command -- only as

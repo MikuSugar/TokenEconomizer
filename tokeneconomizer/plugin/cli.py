@@ -1,6 +1,7 @@
 """`te` -- inspect and steer what TokenEconomizer does in your sessions.
 
     te status                         what it has learned for this repository, and what it did
+    te status --explain               explain the current settings and saved learning state
     te microskills                    the facts it injects, and the ones still forming
     te toolprune show                 the proposed deny list, and the evidence behind it
     te toolprune apply [ITEM ...]     write the proposal (or the named items) to the repository's
@@ -18,6 +19,12 @@
     te config unset KEY ...           back to the next source down (the global file, then default)
     te repomap [show | refresh]       the repository map (`repomap=on`): what is cached, or
                                       make it now
+    te history import [--dry-run]     Claude Code: fold this repository's sessions from before
+                                      the plugin, from Claude Code's own logs (no model calls,
+                                      no deny list written; only before any session is folded;
+                                      with `history_import=on`, the first session start runs
+                                      it by itself)
+    te history [import --status]      what that import did here
     te repos                          every repository with state here: how it was identified,
                                       its agents and sessions, the checkouts seen
     te repos migrate                  send state recorded under earlier keys where it belongs
@@ -31,8 +38,8 @@
 
 `te facts` and `te untool` are the earlier names of `microskills` and `toolprune`, and still work.
 `--cwd` picks the repository (default: the current directory) and `--host` the agent
-(claude | codex | copilot | pi | dsh; default: `TE_HOST`, else the agent whose shell runs `te`,
-else claude).
+(claude | codex | copilot | cursor | dsh | hermes | opencode | pi; default: `TE_HOST`, else
+the agent whose shell runs `te`, else claude).
 """
 import argparse
 import glob
@@ -42,7 +49,8 @@ import sys
 import time
 
 from .. import loopguard
-from . import accounting, denylist, fold, hosts, paths, repomap, repos, sidecall, toolcheck
+from . import (accounting, denylist, fold, history, hosts, paths, repomap, repos, sidecall,
+               toolcheck)
 from .config import canonical, unset_config, write_config
 from .context import LiveContext
 from .paths import state_root
@@ -105,6 +113,94 @@ def _session_note(ctx, env=None):
 
 
 # ---- status / microskills ------------------------------------------------------------------
+def _status_explanations(ctx, inj, unt, tracker, applied):
+    """Describe the latest saved state, never infer why a past turn did not intervene.
+
+    This deliberately reuses the CLI snapshots, not mechanism internals or fresh model calls.
+    The detailed commands already show individual facts and tool evidence.
+    """
+    cfg = ctx.config
+    if not cfg.enabled:
+        return {"plugin": "plugin is disabled; hooks record nothing"}
+    notes = {}
+    if cfg.shadow:
+        notes["plugin"] = "shadow mode: new decisions are recorded, not applied"
+    host = ctx.host.name
+    facts_detail = "see microskills with the same --host/--cwd"
+    tools_detail = "see toolprune with the same --host/--cwd"
+    paused = sidecall.paused(host, ctx.root)
+
+    if cfg.microskills == "off":
+        notes["microskills"] = "off; cached facts are not injected"
+    elif inj.get("rendered"):
+        notes["microskills"] = ("cached facts present; injection suppressed in shadow mode"
+                                if cfg.shadow else "cached facts are available for session start")
+        if "distiller" in cfg.microskills and paused:
+            notes["microskills"] += "; model proposer paused"
+    elif "distiller" in cfg.microskills and paused:
+        notes["microskills"] = f"model proposer paused after a sign-in failure; {facts_detail}"
+    elif not inj:
+        notes["microskills"] = "no learning snapshot recorded for this agent/repository yet"
+    else:
+        facts = inj.get("facts")
+        if not isinstance(facts, dict):
+            why = "no fact details recorded in the last learning snapshot"
+        else:
+            # Metadata is not a fact, and an unfamiliar state is not evidence of zero facts.
+            rows = [v for k, v in facts.items()
+                    if k not in ("_profile", "_vocab", "_task", "_extractors")]
+            states = ("CANDIDATE", "ACTIVE", "RETIRED")
+            if any(not isinstance(v, dict) or v.get("state") not in states for v in rows):
+                why = "fact lifecycle details unavailable in the last learning snapshot"
+            elif rows:
+                counts = [sum(v["state"] == state for v in rows) for state in states]
+                why = (f"{counts[0]} candidate, {counts[1]} active, "
+                       f"{counts[2]} retired; no facts rendered")
+            else:
+                why = "no facts tracked in the last learning snapshot"
+        notes["microskills"] = f"{why}; {facts_detail}"
+
+    if not denylist.supports(host):
+        notes["toolprune"] = f"tool pruning is not available on {host}"
+    elif cfg.toolprune == "off":
+        notes["toolprune"] = "off; previously applied rules are not restored automatically"
+    else:
+        proposal = _proposal(ctx, unt)
+        held = unt.get("auto_pending")
+        pending = held.get("items") if isinstance(held, dict) else None
+        pending = pending if isinstance(pending, list) else []
+        if proposal:
+            if cfg.shadow:
+                why = "proposal recorded in shadow mode"
+            elif cfg.toolprune == "propose":
+                why = "proposal awaiting approval"
+            elif unt.get("auto_apply_refused"):
+                why = "automatic apply was refused"
+            elif any(t in proposal for t in pending):
+                why = "proposal held for the idle wait"
+            else:
+                why = "unapplied proposal recorded"
+        elif applied:
+            why = "deny rules recorded as applied for this checkout"
+        elif not unt:
+            why = "no tool-usage snapshot recorded for this agent/repository yet"
+        else:
+            # A zero proposal can mean used/protected/kept items, not just too little evidence.
+            why = "no eligible proposal recorded"
+        notes["toolprune"] = f"{why}; {tools_detail}"
+
+    if cfg.loopguard == "off":
+        notes["loopguard"] = "off"
+    elif tracker.envelope is None:
+        notes["loopguard"] = (f"learning baseline: {len(tracker.resolved_turns)}/"
+                              f"{tracker.min_samples} ended-green turns")
+    elif paused:
+        notes["loopguard"] = "judge calls paused after a sign-in failure; backstop remains active"
+    else:
+        notes["loopguard"] = "baseline ready; per-turn reasons cannot be inferred from these totals"
+    return notes
+
+
 def cmd_status(args):
     ctx = _ctx(args)
     cfg = ctx.config
@@ -117,20 +213,32 @@ def cmd_status(args):
     env_tracker = loopguard.load_envelope(ctx.store, cfg.loopguard_aggr,
                                           cfg.loopguard_thresholds)
     ledger = accounting.summarize(ctx.store.read_lines("ledger.jsonl"))
+    # Sessions imported from the agent's history are counted apart from the plugin's own.
+    inj_imported = int(inj.get("imported_sessions", 0) or 0)
+    unt_imported = int(unt.get("imported_sessions", 0) or 0)
     out.update({
         "microskills": {"profile": cfg.microskills,
                         "injected_lines": sum(1 for ln in (inj.get("rendered") or "").splitlines()
                                               if ln.startswith("- ")),
-                        "sessions_folded": inj.get("sessions", 0)},
-        "toolprune": {"mode": cfg.toolprune, "sessions": unt.get("sessions", 0),
-                      "prompts": unt.get("prompts", 0),
+                        "sessions_folded": int(inj.get("sessions", 0) or 0) - inj_imported,
+                        "imported_sessions": inj_imported},
+        "toolprune": {"mode": cfg.toolprune,
+                      "sessions": int(unt.get("sessions", 0) or 0) - unt_imported,
+                      "prompts": (int(unt.get("prompts", 0) or 0)
+                                  - int(unt.get("imported_prompts", 0) or 0)),
+                      "imported_sessions": unt_imported,
+                      "imported_prompts": int(unt.get("imported_prompts", 0) or 0),
                       "catalog_source": unt.get("catalog_source"),
                       "proposal": unt.get("proposal", []),
                       "applied": denylist.applied_for(ctx.store, ctx.repo.root,
                                                       ctx.host.name)},
         "loopguard": {"mode": cfg.loopguard, "envelope": env_tracker.envelope,
                       "ended_green_turns": len(env_tracker.resolved_turns)},
+        "history": history.summary(ctx),
         "ledger": ledger})
+    if getattr(args, "explain", False):
+        out["explanations"] = _status_explanations(ctx, inj, unt, env_tracker,
+                                                 out["toolprune"]["applied"])
     if args.json:
         print(json.dumps(out, indent=2, default=str))
         return 0
@@ -150,20 +258,29 @@ def cmd_status(args):
         print(f"  warning      {w}")
     if out["session_note"]:
         print(f"  note         {out['session_note']}")
-    print(f"  sessions     {ledger['sessions']} folded, "
+    def earlier(n):
+        return f" (+{n} from earlier history)" if n else ""
+    print(f"  sessions     {ledger['sessions']} folded{earlier(ledger['imported_sessions'])}, "
           f"{accounting.fmt_tokens(ledger['effective_tokens'])} effective tokens, plugin "
           f"overhead {accounting.fmt_tokens(ledger['overhead_tokens'])} "
           f"({ledger['overhead_frac']:.1%})")
+    hist = history.describe(out["history"])
+    if hist:
+        print(f"  history      {hist}")
     i = out["microskills"]
     print(f"  microskills  {i['injected_lines']} fact(s) injected at session start "
-          f"({i['sessions_folded']} sessions learned from)")
+          f"({i['sessions_folded']} sessions learned from"
+          + (f", +{i['imported_sessions']} from earlier history" if i["imported_sessions"]
+             else "") + ")")
     u = out["toolprune"]
     if not denylist.supports(ctx.host.name):
         print("  toolprune    not available on this host")
     else:
         src = u["catalog_source"] or "none yet"
-        print(f"  toolprune    {u['sessions']} sessions ({u['prompts']} prompts) observed, "
-              f"catalog: {src}; "
+        print(f"  toolprune    {u['sessions']} sessions ({u['prompts']} prompts) observed"
+              + (f" (+{u['imported_sessions']} from earlier history, {u['imported_prompts']} "
+                 f"prompts)" if u["imported_sessions"] else "")
+              + f", catalog: {src}; "
               f"proposed {denylist.unit(ctx.host.name, plural=True)}: "
               f"{', '.join(u['proposal']) or '-'}; applied: {', '.join(u['applied']) or '-'}")
     sp = out["loopguard"]
@@ -171,6 +288,8 @@ def cmd_status(args):
     print(f"  loopguard    envelope {env_s} ({sp['ended_green_turns']} ended-green turns); "
           f"{ledger['nudges']} redirect(s), {ledger['aborts']} still-stuck notice(s) over "
           f"{ledger['turns']} turns")
+    for name, why in out.get("explanations", {}).items():
+        print(f"  explain      {name}: {why}")
     return 0
 
 
@@ -211,6 +330,13 @@ def _toolprune_show(ctx, unt):
     print(f"applied ({denylist.unit(host, plural=True)}, from {_where(ctx, host)}): "
           f"{', '.join(denylist.applied_for(ctx.store, ctx.repo.root, host)) or '-'}")
     print(f"proposed: {', '.join(_proposal(ctx, unt)) or '-'}")
+    if unt.get("imported_sessions"):
+        print(f"of which {unt['imported_sessions']} from before the plugin "
+              f"({unt.get('imported_prompts', 0)} prompts), read from the agent's history")
+    waiting = [t for t in unt.get("needs_apply") or [] if t in _proposal(ctx, unt)]
+    if waiting and ctx.config.toolprune == "auto":
+        print(f"waiting for `toolprune apply`: {', '.join(waiting)} (the evidence for them "
+              f"includes sessions from before the plugin, so `auto` does not write them)")
     pending = [t for t in (unt.get("auto_pending") or {}).get("items") or []
                if t in _proposal(ctx, unt)]
     if pending and ctx.config.toolprune == "auto":
@@ -473,6 +599,11 @@ def _config_view(cfg):
             "loopguard_nudges": d.pop("loopguard_nudges"),
             "thresholds": loopguard.base_thresholds(cfg.loopguard_aggr, pinned),
             "pinned": sorted(pinned)},
+        "history": {"state": "on" if cfg.history_import else "off",
+                    "history_import": d.pop("history_import"),
+                    "history_max_sessions": d.pop("history_max_sessions"),
+                    "history_days": d.pop("history_days"),
+                    "history_dirs": d.pop("history_dirs")},
         "other": d,
         "warnings": cfg.warnings,
     }
@@ -536,6 +667,55 @@ def cmd_fold(args):
         rec = fold.fold_session(ctx, sid)
         if rec is not None and args.verbose:
             print(json.dumps(rec, default=str))
+    return 0
+
+
+def _print_history(ctx, doc):
+    if not doc:
+        print(f"no import of earlier sessions recorded for {ctx.repo.label}"
+              + ("" if ctx.config.history_import else " (history_import is off)"))
+        return
+    print(f"{ctx.repo.label}: {history.describe(doc) or doc.get('state')}")
+    skipped = doc.get("skipped") if isinstance(doc.get("skipped"), dict) else {}
+    if doc.get("over_limit"):
+        skipped = dict(skipped, older_than_the_newest=doc["over_limit"])
+    if skipped:
+        print("left out: " + ", ".join(f"{k} {v}" for k, v in sorted(skipped.items())))
+
+
+def cmd_history(args):
+    """`te history [import]`: a repository's sessions from before the plugin (Claude Code)."""
+    ctx = _ctx(args)
+    if args.action == "status" or args.status:
+        _print_history(ctx, history.summary(ctx))
+        return 0
+    if not ctx.host.keeps_history:
+        print(f"{ctx.host.name}: no session history the plugin reads (Claude Code only)")
+        return 1
+    if args.dry_run:
+        p = history.plan(ctx)
+        print(f"{len(p['sessions'])} earlier session(s) of {ctx.repo.label} would be read"
+              + (f", oldest {_when(p['sessions'][0]['started'])}, newest "
+                 f"{_when(p['sessions'][-1]['started'])}" if p["sessions"] else ""))
+        skipped = dict(p["skipped"], **({"older_than_the_newest": p["over_limit"]}
+                                        if p["over_limit"] else {}))
+        if skipped:
+            print("left out: " + ", ".join(f"{k} {v}" for k, v in sorted(skipped.items())))
+        why = history._refusal(ctx, False)
+        if why:
+            print(f"not importable now: {why}")
+        return 0
+    if _refuse_unwritable(ctx.store.base):
+        return 1
+    res = history.run(ctx, auto=args.auto, log=lambda line: print(line, flush=True))
+    if args.auto:
+        return 0
+    if res["state"] in ("refused", "skipped", "busy"):
+        print(f"not imported: {res['reason']}")
+        return 1
+    print(f"imported {res['imported']} earlier session(s) of {ctx.repo.label}"
+          + (f"; stopped at its time budget with {res['left']} to go (`te history import` "
+             f"resumes)" if res["state"] == "partial" else ""))
     return 0
 
 
@@ -614,8 +794,10 @@ def cmd_repos(args):
                                                   else ""))
         print("  identified   " + (repos.how_words(row["how"], row["remote"]) if row["how"]
                                    else "recorded by an earlier version"))
-        print("  sessions     " + (", ".join(f"{h} {n}" for h, n in row["agents"].items())
-                                   or "none") + f"; last {_when(row['last'])}")
+        imported = row.get("imported") or {}
+        print("  sessions     " + (", ".join(
+            f"{h} {n}" + (f" (+{imported[h]} from earlier history)" if imported.get(h) else "")
+            for h, n in row["agents"].items()) or "none") + f"; last {_when(row['last'])}")
         if row["checkouts"]:
             print("  checkouts    " + ", ".join(row["checkouts"]))
         elif row["cwds"]:
@@ -652,8 +834,9 @@ def cmd_doctor(args):
         ok = False
     import shutil as _sh
     # Only the agents installed here: a Codex-only machine has no Claude Code catalog to probe.
-    agents = [h for h in ("claude", "codex", "copilot", "opencode", "pi", "cursor")
+    agents = [h for h in ("claude", "codex", "copilot", "hermes", "opencode", "pi", "cursor")
               if _sh.which(sidecall.claude_cli() if h == "claude"
+                           else sidecall.hermes_cli() if h == "hermes"
                            else "cursor-agent" if h == "cursor" else h)]
     # The DeepSeek Harness is a GUI application, not a command: its state (or the environment
     # its own shell sets) is what says it works in this repository.
@@ -662,7 +845,7 @@ def cmd_doctor(args):
     if harness:
         agents.append("dsh")
     print(f"agents      "
-          f"{', '.join(agents) or 'none of claude, codex, copilot, opencode, pi, cursor on PATH'}")
+          f"{', '.join(agents) or 'none of claude, codex, copilot, hermes, opencode, pi, cursor, dsh on PATH'}")
     for h in agents:
         pause = sidecall.paused(h, root)
         if pause:
@@ -696,6 +879,10 @@ def cmd_doctor(args):
         if ctrust is not None:
             print(f"copilot     this folder is {'trusted' if ctrust else 'NOT trusted'} (an "
                   f"untrusted folder's .github/copilot settings are ignored)")
+    if "hermes" in agents:
+        link = os.path.join(sidecall.hermes_home(), "plugins", "tokeneconomizer")
+        print(f"hermes      plugin {'linked at ' + link if os.path.exists(link) else 'not in ' + link}"
+              f" (it also needs `hermes plugins enable tokeneconomizer`)")
     if "pi" in agents:
         settings = os.path.join(os.environ.get("PI_CODING_AGENT_DIR") or os.path.join(
             os.path.expanduser("~"), ".pi", "agent"), "settings.json")
@@ -757,6 +944,8 @@ def build_parser():
 
     p = add("status")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--explain", action="store_true",
+                   help="briefly explain current settings and saved state (no model calls)")
     p.set_defaults(fn=cmd_status)
     add("microskills", "facts").set_defaults(fn=cmd_microskills)
     p = add("toolprune", "untool")
@@ -785,6 +974,13 @@ def build_parser():
     p.add_argument("--json", action="store_true")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_repos)
+    p = add("history")
+    p.add_argument("action", nargs="?", default="status", choices=("status", "import"))
+    p.add_argument("--dry-run", action="store_true",
+                   help="say what would be imported, change nothing")
+    p.add_argument("--status", action="store_true", help="what the import did here")
+    p.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_history)
     p = add("repomap")
     p.add_argument("action", nargs="?", default="show", choices=("show", "refresh"))
     p.set_defaults(fn=cmd_repomap)
